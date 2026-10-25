@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Memory Archive",
+    "description": "Keeps a verbatim copy of the conversation in the workspace and tells the model where it is, so compaction never becomes the only copy."
+  }
+}
