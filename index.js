@@ -10,17 +10,20 @@
  * It never touches session content. Everything it does is read-the-session,
  * write-our-own-files:
  *
- *   <workspace>/.dsh-memory/staging/NNNN.md        exchanges copied, not yet packed
- *   <workspace>/.dsh-memory/packs/pack-NNN/NN.md   one exchange per file
- *   <workspace>/.dsh-memory/packs/pack-NNN/_note.md  the pack's index and range
- *   <workspace>/AGENTS.local.md                    the pointer the model reads
+ *   <workspace>/.dsh-memory/<session>/staging/NNNN.md        copied, not yet packed
+ *   <workspace>/.dsh-memory/<session>/packs/pack-NNN/NN.md   one exchange per file
+ *   <workspace>/.dsh-memory/<session>/packs/pack-NNN/_note.md  the pack's index
  *
- * No language model is called. The model maintains its own notes: the index is
- * written here, and anything it adds below the marker is preserved.
+ * The `<session>` level exists because question seqs restart at zero in every
+ * session: two sessions in one workspace would otherwise write the same
+ * `0008.md` over each other. The workspace level exists because the archive
+ * belongs to the folder, so moving or changing the workspace moves the archive
+ * with it instead of leaving it behind.
  *
- * The pointer states what the archive covers and where the gaps are. An index
- * that reads as tidier than the archive really is would be worse than no index,
- * because a reader trusts it.
+ * No language model is called and no prompt file is written. The model is told
+ * where its archive is through a system-prompt section whose path is derived
+ * from the live session on every step, which is the only way the answer stays
+ * right when several sessions share one workspace.
  *
  * Pack modes, mutually exclusive:
  *
@@ -29,23 +32,30 @@
  */
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 import { homedir } from 'node:os'
 
 import {
   coverage,
   digestBodies,
-  digestPack,
   listPacks,
   listStaged,
   packStaged,
   seqOfStaged,
-  stagedUnanswered,
   stagingChars,
   stagingDir,
 } from './pack.mjs'
 
 export const name = 'memory-archive'
+
+/**
+ * Services this plugin reads.
+ *
+ * `commands` backs `/memory` and the panel. `systemPrompt` is what makes the
+ * per-step archive path possible; it is required here because the archive is
+ * useless to the model if it is never told where the files are.
+ */
+export const inject = ['commands', 'systemPrompt']
 
 const DEFAULTS = {
   /** 'manual' packs on a fixed number of exchanges; 'sync' follows DSH compaction. */
@@ -58,10 +68,6 @@ const DEFAULTS = {
   warnAtChars: 200_000,
 }
 
-const POINTER_FILE = 'AGENTS.local.md'
-const BLOCK_START = '<!-- dsh-memory:begin -->'
-const BLOCK_END = '<!-- dsh-memory:end -->'
-
 const LOG_PATH = (() => {
   try {
     const bridge = '\\\\vmware-host\\Shared Folders\\dsh-portable\\_bridge\\logs'
@@ -71,24 +77,6 @@ const LOG_PATH = (() => {
   }
   return join(homedir(), 'memory-archive.log')
 })()
-
-/**
- * Append one line to the archive's own change log.
- *
- * Written from the same code path that changes the archive, not by hand: a log
- * that depends on someone remembering to write it stops exactly when things get
- * busy, and then describes a state that no longer exists.
- */
-function appendAudit(root, message) {
-  try {
-    mkdirSync(root, { recursive: true })
-    const file = join(root, '_archive-log.md')
-    const line = `- ${new Date().toISOString()} ${message}` + '\n'
-    appendFileSync(file, line, 'utf8')
-  } catch {
-    /* the archive itself must not fail because its log did */
-  }
-}
 
 function log(...parts) {
   const line = `[memory ${new Date().toISOString()}] ${parts.join(' ')}`
@@ -160,7 +148,8 @@ export function exchangesFromRows(rows) {
   for (const row of rows) {
     const isQuestion = row?.type === 'user/message' && row?.data?.source?.kind === 'user'
     if (isQuestion) {
-      if (current !== null) exchanges.push(current)
+      // A held-over question is flushed only when it got an answer; see below.
+      if (current !== null && current.answer !== '') exchanges.push(current)
       current = {
         seq: row.seq,
         question: stripCode(textOf(row.data.content)),
@@ -173,7 +162,15 @@ export function exchangesFromRows(rows) {
       if (text) current.answer = text
     }
   }
-  if (current !== null) exchanges.push(current)
+  // The last question is deliberately NOT pushed when it has no answer.
+  //
+  // While this runs, the question being answered right now looks exactly like a
+  // question whose answer was lost: the user message exists, the assistant
+  // message does not yet. Writing that out produces a file claiming the answer
+  // was never captured — a statement about the past made while the answer is
+  // still being produced. Only a question that already has an answer is a
+  // finished exchange.
+  if (current !== null && current.answer !== '') exchanges.push(current)
   return exchanges
 }
 
@@ -211,11 +208,10 @@ export function stageExchanges(root, exchanges) {
   // cannot tell whether an exchange was already captured — that is how four
   // identical packs came out. A pack records the seq range it covers, so the
   // answer is in the archive itself and needs no separate bookkeeping.
-  // Ask the archive rather than a span: coverage now reports the exact set of
+  // Ask the archive rather than a span: coverage reports the exact set of
   // question seqs it holds, so membership is a set lookup and a question that
   // sits between two packs is correctly seen as archived.
-  const cover = coverage(root)
-  const coveredSet = new Set(cover.covered ?? [])
+  const coveredSet = new Set(coverage(root).covered)
   const archived = (seq) => coveredSet.has(seq)
 
   let written = 0
@@ -256,120 +252,6 @@ function previewDigest(dir, count) {
 }
 
 // ---------------------------------------------------------------------------
-// the pointer file
-// ---------------------------------------------------------------------------
-
-
-export function renderBlock(rootDir, state) {
-  const { packs, stagedFiles, gaps, unknownRange, minSeq, maxSeq, coveredCount, warning } = state
-  const lines = [BLOCK_START, '## 早期记忆', '']
-
-  if (packs.length === 0) {
-    lines.push('本会话还没有打包的记忆。')
-  } else {
-    lines.push(`更早的对话已归档在工作区的 \`${rootDir}/packs/\`。`)
-    lines.push('')
-    lines.push('每个 `pack-NNN/` 是一个包，里面的 `01.md`、`02.md`… 各是一轮完整的问答。')
-    lines.push('`pack-NNN/_note.md` 是包的目录和覆盖范围；需要时可以把自己的注释补写在里面。')
-    lines.push('')
-    lines.push('### 已归档')
-    // The index names no range on purpose.
-    //
-    // A pack holds a *set* of questions, and two packs either side of a third
-    // can share a numeric span with it while covering different questions. A
-    // range here would be the authoritative file stating the least precise
-    // thing on the topic, so the index defers to the pack's own note whenever a
-    // caller needs the exact list.
-    for (const pack of packs) {
-      const seqs = Array.isArray(pack.seqs) ? pack.seqs : []
-      const missing = pack.unanswered > 0 ? `，其中 ${pack.unanswered} 轮答案未捕获` : ''
-      const detail = seqs.length > 0 ? '，问句清单见其 `_note.md`' : '，问句序号未记录'
-      lines.push(`- \`${pack.name}/\` — ${pack.count} 轮${missing}${detail}`)
-    }
-
-    if (unknownRange.length > 0) {
-      lines.push('')
-      lines.push(`注意：${unknownRange.join('、')} 没有记录覆盖的问句序号，无法与对话核对。`)
-    }
-
-    if (gaps.length > 0) {
-      lines.push('')
-      lines.push('### 缺口')
-      lines.push('以下对话**不在**任何包里：')
-      for (const gap of gaps) {
-        lines.push(gap.from === gap.to ? `- seq ${gap.from}` : `- seq ${gap.from}–${gap.to}`)
-      }
-    }
-
-    if (minSeq !== null) {
-      lines.push('')
-      lines.push(`共归档 ${coveredCount} 轮对话。`)
-    }
-  }
-
-  if (stagedFiles.length > 0) {
-    const seqs = stagedFiles.map(seqOfStaged).filter((n) => n !== null)
-    const range = seqs.length > 0 ? `${Math.min(...seqs)}–${Math.max(...seqs)}` : '未知'
-    // The staged area gets the same honesty as the packs: an exchange whose
-    // answer was never captured is reported here too, otherwise a reader would
-    // take the staged set as complete.
-    const stagedMissing = state.stagedUnanswered ?? 0
-    const missingNote = stagedMissing > 0 ? `，其中 ${stagedMissing} 轮答案未捕获` : ''
-    lines.push('')
-    lines.push(
-      `另有 ${stagedFiles.length} 轮尚未打包${missingNote}，暂存在 \`${rootDir}/staging/\`（seq ${range}）。`,
-    )
-    lines.push('它们还没有进入任何包，读 packs 时看不到这些。')
-  } else if (packs.length > 0) {
-    lines.push('')
-    lines.push('staging 当前为空：所有已记录的对话都已进入包。')
-  }
-
-  if (state.noticed) {
-    lines.push('')
-    lines.push(`（${state.noticed}）`)
-  }
-
-  if (warning) {
-    lines.push('')
-    lines.push(`⚠️ ${warning}`)
-  }
-
-  // A reader cannot tell when this description was written from anything else
-  // in the file, and a stale index is indistinguishable from a fresh one.
-  lines.push('')
-  lines.push(`_本段由记忆插件于 ${state.generatedAt ?? new Date().toISOString()} 生成。_`)
-
-  lines.push('', BLOCK_END)
-  return lines.join('\n')
-}
-
-export function writePointer(workspace, rootDir, state) {
-  const file = join(workspace, POINTER_FILE)
-  const block = renderBlock(rootDir, state)
-  let existing = ''
-  if (existsSync(file)) {
-    try {
-      existing = readFileSync(file, 'utf8')
-    } catch {
-      existing = ''
-    }
-  }
-  const start = existing.indexOf(BLOCK_START)
-  const end = existing.indexOf(BLOCK_END)
-  let next
-  if (start >= 0 && end > start) {
-    next = existing.slice(0, start) + block + existing.slice(end + BLOCK_END.length)
-  } else if (existing.trim() === '') {
-    next = block + '\n'
-  } else {
-    next = existing.replace(/\s*$/, '') + '\n\n' + block + '\n'
-  }
-  writeFileSync(file, next, 'utf8')
-  return file
-}
-
-// ---------------------------------------------------------------------------
 // plugin
 // ---------------------------------------------------------------------------
 
@@ -377,21 +259,117 @@ function workspaceOf(session) {
   return session?.header?.cwd ?? session?.header?.workingDirectory ?? process.cwd()
 }
 
+/**
+ * The session's own archive directory.
+ *
+ * Three levels, each earning its place:
+ *
+ *   <workspace>            the archive belongs to a working directory, so a
+ *                          session that switches folders keeps finding it
+ *                          where its own files live
+ *   .dsh-memory            one root, easy to find, easy to delete
+ *   <session id, 8 chars>  question seqs restart per session, so two sessions
+ *                          in one workspace would otherwise write the same
+ *                          `0008.md` over each other
+ *
+ * Eight characters of a UUID is short enough to read in a path and long enough
+ * that a collision would have to be deliberate.
+ */
+/**
+ * Short, filesystem-safe handle for a Session id.
+ *
+ * Session ids arrive as `session-<uuid>`, so the first eight characters of the
+ * raw id are the literal string `session-` — every Session would map to the same
+ * directory. The prefix is dropped and the remainder reduced to eight
+ * alphanumerics first.
+ */
+function shortId(sessionId) {
+  return String(sessionId)
+    .replace(/^session-/, '')
+    .replace(/[^a-z0-9]/gi, '')
+    .slice(0, 8)
+}
+
+/**
+ * The archive path as it should appear in text the model reads.
+ *
+ * Relative to the workspace, because the model finds the workspace itself, and a
+ * relative path stays correct when the workspace is moved.
+ */
+export function shortRootLabel(session, rootDir = '.dsh-memory') {
+  return `${rootDir}/${shortId(session?.header?.id ?? 'unnamed')}`
+}
+
+export function archiveRoot(session, rootDir = '.dsh-memory') {
+  const workspace = workspaceOf(session)
+  return join(workspace, rootDir, shortId(session?.header?.id ?? 'unnamed'))
+}
+
+/**
+ * Where this plugin keeps its own settings.
+ *
+ * A file of our own rather than the profile's `cordis.patch.yml`, because the
+ * patch addresses entries by Loader id and a bundle loaded through
+ * `dsh.profile.bundles` does not reliably answer to any id we can predict —
+ * writing there produced a config the plugin never saw. A JSON file next to the
+ * profile is readable, writable, inspectable, and needs no match on ids.
+ */
+const SETTINGS_PATH = (() => {
+  const home = process.env.DSH_HOME ?? join(homedir(), '.dsh')
+  return join(home, 'memory-archive.json')
+})()
+
+/** Read the saved settings, or an empty object when there is nothing usable. */
+function readSettings() {
+  try {
+    if (!existsSync(SETTINGS_PATH)) return {}
+    const raw = JSON.parse(readFileSync(SETTINGS_PATH, 'utf8'))
+    if (raw === null || typeof raw !== 'object') return {}
+    const out = {}
+    if (raw.mode === 'manual' || raw.mode === 'sync') out.mode = raw.mode
+    if (Number.isFinite(raw.windowRounds) && raw.windowRounds > 0) {
+      out.windowRounds = Math.round(raw.windowRounds)
+    }
+    if (Number.isFinite(raw.warnAtChars) && raw.warnAtChars > 0) {
+      out.warnAtChars = Math.round(raw.warnAtChars)
+    }
+    if (typeof raw.rootDir === 'string' && raw.rootDir.trim() !== '') out.rootDir = raw.rootDir
+    return out
+  } catch {
+    return {}
+  }
+}
+
+/** Persist the settings, merging into whatever is already on disk. */
+function writeSettings(patch) {
+  const next = { ...readSettings(), ...patch }
+  mkdirSync(join(SETTINGS_PATH, '..'), { recursive: true })
+  writeFileSync(SETTINGS_PATH, `${JSON.stringify(next, null, 2)}\n`, 'utf8')
+  return next
+}
+
+/**
+ * The live settings.
+ *
+ * Re-read on every use rather than captured at load: a change made through the
+ * panel then takes effect on the next exchange, instead of requiring a restart
+ * for something that is only a number.
+ */
+function currentOptions(base) {
+  return { ...base, ...readSettings() }
+}
+
 export function apply(ctx, config = {}) {
-  const options = { ...DEFAULTS, ...config }
-  log(
-    'applying: mode=%s windowRounds=%d rootDir=%s',
-    options.mode,
-    options.windowRounds,
-    options.rootDir,
-  )
+  const base = { ...DEFAULTS, ...config }
+  log('applying: mode=%s windowRounds=%d rootDir=%s', base.mode, base.windowRounds, base.rootDir)
+  log('settings file: %s', SETTINGS_PATH)
 
   const warned = new Set()
 
   const archive = (session, reason) => {
     try {
-      const workspace = workspaceOf(session)
-      const root = join(workspace, options.rootDir)
+      const options = currentOptions(base)
+      const root = archiveRoot(session, options.rootDir)
 
       // Read the exchanges out of the live session object rather than the log
       // file: no path to locate, no zstd to decode, and it works while the log
@@ -415,7 +393,6 @@ export function apply(ctx, config = {}) {
       // content — the digest of what would be written versus the digest the
       // pack recorded for itself.
       let packed = null
-      let skippedMessage = null
       const stagedCount = listStaged(stagingDir(root)).length
 
       const shouldPack =
@@ -430,8 +407,7 @@ export function apply(ctx, config = {}) {
 
         if (existing !== undefined) {
           // Identical content is already archived. Drop the staged copies
-          // without rewriting, so nothing changes and nothing is logged as a
-          // change.
+          // without rewriting: nothing changes, so nothing is written.
           for (const name of listStaged(stagingDir(root)).slice(0, take)) {
             try {
               unlinkSync(join(stagingDir(root), name))
@@ -439,77 +415,29 @@ export function apply(ctx, config = {}) {
               /* retry next time */
             }
           }
-          skippedMessage = `已有内容相同的 ${existing.name}，跳过写入（摘要 ${preview.digest}）。`
           log('skip: identical to %s (%s)', existing.name, preview.digest)
         } else {
-          const previous = listPacks(root)
           packed = packStaged(root, take)
-
-          if (packed !== null && packed.incomplete !== true) {
-            const sameSeqs = previous.find(
-              (p) =>
-                p.seqs.length === packed.seqs.length &&
-                p.seqs.every((s, i) => s === packed.seqs[i]),
-            )
-            const repaired = previous.filter(
-              (p) => p.digest !== null && p.digest !== packed.digest && p.dir !== packed.dir,
-            )
-
-            if (sameSeqs !== undefined && sameSeqs.digest === packed.digest) {
-              // Same questions, same content, but the old pack's copy on disk no
-              // longer matched its own recorded digest. Calling this "created"
-              // would describe the archive getting longer when in fact a damaged
-              // copy was restored; the two mean opposite things to a reader.
-              appendAudit(
-                root,
-                `修复 ${packed.packName}（本地副本与记录的摘要不一致，已从会话重建）：` +
-                  `${packed.count} 轮，摘要 ${packed.digest}。`,
-              )
-            } else if (sameSeqs !== undefined && sameSeqs.digest !== null) {
-              appendAudit(
-                root,
-                `替换 ${packed.packName}：同问句但内容不同，摘要 ${sameSeqs.digest} → ${packed.digest}。`,
-              )
-            } else {
-              appendAudit(
-                root,
-                `新建 ${packed.packName}：${packed.count} 轮，问句 ${packed.seqs.length} 个，摘要 ${packed.digest}。`,
-              )
-            }
-
-            if (repaired.length > 0) {
-              appendAudit(
-                root,
-                `全量重建 ${repaired.length + 1} 个包（触发：${repaired.map((p) => p.name).join('、')} 摘要不一致）。`,
-              )
-            }
-          }
         }
       }
 
-      if (packed !== null) {
-        if (packed.incomplete === true) {
-          log(
-            'pack %s INCOMPLETE: wrote %d of %d files; staging kept for retry',
-            packed.packName,
-            packed.written,
-            packed.count,
-          )
-          appendAudit(
-            root,
-            `打包 ${packed.packName} 未完成：写出 ${packed.written}/${packed.count} 个文件，暂存区保留待重试。`,
-          )
-        } else {
-          log(
-            'packed %s: %d exchanges, seq %d..%d, digest %s [staged %d new]',
-            packed.packName,
-            packed.count,
-            packed.minSeq,
-            packed.maxSeq,
-            packed.digest,
-            staged.written,
-          )
-        }
+      if (packed !== null && packed.incomplete !== true) {
+        log(
+          'packed %s: %d exchanges, seq %d..%d, digest %s [staged %d new]',
+          packed.packName,
+          packed.count,
+          packed.minSeq,
+          packed.maxSeq,
+          packed.digest,
+          staged.written,
+        )
+      } else if (packed !== null) {
+        log(
+          'pack %s INCOMPLETE: wrote %d of %d files; staging kept for retry',
+          packed.packName,
+          packed.written,
+          packed.count,
+        )
       }
 
       const chars = stagingChars(stagingDir(root))
@@ -523,23 +451,19 @@ export function apply(ctx, config = {}) {
         }
       }
 
-      // Pass the session's own question seqs so "gap" means "a question this
-      // session really has that no pack holds", not "a number that is missing
-      // from a span".
-      const cover = coverage(root, exchanges.map((e) => e.seq))
-      writePointer(workspace, options.rootDir, {
-        packs: cover.packs,
-        stagedFiles: listStaged(stagingDir(root)),
-        gaps: cover.gaps,
-        unknownRange: cover.unknownRange,
-        minSeq: cover.minSeq,
-        maxSeq: cover.maxSeq,
-        coveredCount: cover.covered.length,
-        stagedUnanswered: stagedUnanswered(stagingDir(root)),
-        generatedAt: new Date().toISOString(),
-        noticed: skippedMessage,
-        warning,
-      })
+      // The archive is complete for this pass; nothing else is written here.
+      //
+      // The model is told where the archive is through a prompt section that
+      // re-resolves every step (see `promptSection` below), not through a file
+      // in the workspace. A file would be shared by every session in the same
+      // workspace and read only once, so two sessions would disagree about which
+      // path the model should use.
+      log(
+        'archived: %d packs, %d staged, warning=%s',
+        listPacks(root).length,
+        listStaged(stagingDir(root)).length,
+        warning === null ? 'none' : 'yes',
+      )
     } catch (error) {
       log('archive failed: %s', String(error?.stack ?? error))
     }
@@ -567,4 +491,199 @@ export function apply(ctx, config = {}) {
   })
 
   log('listening on session/event (assistant/message, compaction/summary)')
+
+  // `/memory` — read and change the packing rhythm without editing YAML by hand.
+  // The panel sends exactly these commands, so the command line and the GUI can
+  // never disagree about what a setting means.
+  if (ctx.commands !== undefined) {
+    try {
+      ctx.effect(() => {
+        const dispose = ctx.commands.register({
+          name: 'memory',
+          description: '记忆归档：查看状态、调整打包节奏（改完下一次归档就生效）',
+          input: {
+            hint: 'status | rounds <n> | mode <manual|sync> | warn <n> | reset',
+          },
+          handler: (invocation) => {
+            // Logged because the command line and the panel reach this through
+            // different paths, and a difference between them is invisible from
+            // the outside: both look like "the command ran".
+            log('command invoked: rawInput=%s', JSON.stringify(invocation?.rawInput ?? null))
+            try {
+              const result = handleMemoryCommand(base, invocation?.rawInput ?? '')
+              log('command result: kind=%s', result?.kind)
+              return result
+            } catch (error) {
+              log('command threw: %s', String(error?.stack ?? error))
+              return { kind: 'error', text: String(error?.message ?? error) }
+            }
+          },
+        })
+        return () => dispose()
+      }, 'memory: command')
+      log('command /memory registered')
+    } catch (error) {
+      log('command registration failed: %s', String(error?.message ?? error))
+    }
+  } else {
+    log('commands service absent; /memory not registered')
+  }
+
+  // The model is told where its archive is on every step.
+  //
+  // `ctx.systemPrompt.context` takes a function, so the line is re-resolved at
+  // each assembly from the live Session — a workspace shared by two Sessions
+  // still gives each one its own path, which writing a file in the workspace
+  // could not do (that file is read once, at Session start, and shared).
+  //
+  // The `agent/pre-step` hook covers the assembly that was already frozen before
+  // this plugin existed: the loop renders the runtime-context snapshot from the
+  // assembly taken *before* the pre-step waterfall, so a line registered into a
+  // running Session is not in it yet. Appending it there is idempotent — the
+  // loop's snapshot comparison keeps it to one occurrence per Session.
+  try {
+    ctx.systemPrompt.context({
+      name: 'memory-archive:home',
+      order: 240,
+      interpolate: false,
+      text: (context) => archiveLine(context.agent),
+    })
+  } catch (error) {
+    log('systemPrompt.context failed: %s', String(error?.message ?? error))
+  }
+
+  ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
+    const decision = await next()
+    if (decision.kind === 'reject' || signal.aborted) return decision
+    const text = archiveLine(agent)
+    if (text === undefined) return decision
+    const rendered = decision.messages.map(renderedContext).filter((value) => value !== undefined)
+    if (rendered.includes(text)) return decision
+    return { ...decision, messages: [...decision.messages, ownMessage(text)] }
+  })
 }
+
+/**
+ * The one line naming this Session's archive directory, or `undefined` when the
+ * Session has no usable working directory.
+ *
+ * Points at `packs/` only. `staging/` holds the exchanges that are still in the
+ * model's own context, so naming it would send the model to read what it already
+ * has; `packs/` is the part that has left the window.
+ *
+ * Created here rather than lazily on first write, so the directory the model is
+ * told about exists before the model goes looking for it.
+ */
+function archiveLine(agent) {
+  const session = agent?.session
+  const cwd = session?.header?.cwd
+  if (cwd === undefined || !isAbsolute(cwd)) return undefined
+  try {
+    const packs = join(archiveRoot(session), 'packs')
+    mkdirSync(packs, { recursive: true })
+    return (
+      `更早的对话归档在：${JSON.stringify(packs)}（一轮问答一个 .md，按包分文件夹）。` +
+      `如果那里是空的，说明还没有打包的历史。`
+    )
+  } catch {
+    return undefined
+  }
+}
+
+/** A runtime-context message carrying exactly that line. */
+function ownMessage(text) {
+  return {
+    role: 'user',
+    content: [{ type: 'text', text }],
+    source: {
+      kind: 'runtime-context',
+      form: 'snapshot',
+      sections: [{ name: 'memory-archive:home', text }],
+    },
+  }
+}
+
+/** Text of a runtime-context message, or `undefined` for anything else. */
+function renderedContext(message) {
+  if (message?.source?.kind !== 'runtime-context') return undefined
+  return message.content.map((block) => (block.type === 'text' ? block.text : '')).join('')
+}
+
+/**
+ * `/memory` implementation.
+ *
+ * Only the rhythm is editable from here. Everything else about the archive —
+ * where it lives, what it holds, whether it is consistent — is derived from the
+ * files, so there is nothing else a command could usefully change.
+ *
+ * Status prints human-readable lines rather than JSON because the same text is
+ * what a user sees when typing the command; the panel parses those lines, which
+ * keeps one representation instead of two that can drift apart.
+ *
+ * Every branch returns a CommandResult — `{kind, text}` — because that is the
+ * only shape the command gateway accepts; a bare string is rejected before it
+ * reaches the user.
+ */
+function handleMemoryCommand(base, raw) {
+  const parts = String(raw ?? '')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+  const sub = parts[0] ?? 'status'
+
+  const ok = (text) => ({ kind: 'success', text })
+  const fail = (text) => ({ kind: 'error', text })
+
+  if (sub === 'status') {
+    const options = currentOptions(base)
+    return ok(
+      [
+        `模式：${options.mode}`,
+        `每包轮数：${options.windowRounds}`,
+        `预警字数：${options.warnAtChars}`,
+        `归档目录：${options.rootDir}`,
+      ].join('\n'),
+    )
+  }
+
+  if (sub === 'rounds' || sub === 'mode' || sub === 'warn') {
+    const value = parts[1]
+    if (value === undefined) return fail(`用法：/memory ${sub} <值>`)
+
+    let parsed
+    if (sub === 'mode') {
+      if (value !== 'manual' && value !== 'sync') {
+        return fail(`模式只能是 manual 或 sync，收到：${value}`)
+      }
+      parsed = value
+    } else {
+      const n = Number(value)
+      if (!Number.isFinite(n) || n <= 0) return fail(`需要一个正数，收到：${value}`)
+      parsed = Math.round(n)
+    }
+
+    const key = sub === 'rounds' ? 'windowRounds' : sub === 'mode' ? 'mode' : 'warnAtChars'
+
+    try {
+      writeSettings({ [key]: parsed })
+    } catch (error) {
+      return fail(`写入失败：${String(error?.message ?? error)}`)
+    }
+    log('config changed: %s=%s', key, String(parsed))
+    // No restart needed: `archive` re-reads the file, so the next exchange
+    // already uses the new value.
+    return ok(`已写入 ${key} = ${String(parsed)}。下一次归档就生效。`)
+  }
+
+  if (sub === 'reset') {
+    try {
+      writeSettings({ ...DEFAULTS })
+    } catch (error) {
+      return fail(`写入失败：${String(error?.message ?? error)}`)
+    }
+    return ok('已恢复默认配置。下一次归档就生效。')
+  }
+
+  return fail('用法：/memory status | rounds <n> | mode <manual|sync> | warn <n> | reset')
+}
+

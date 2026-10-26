@@ -1,34 +1,21 @@
 {
   "name": "@local/dsh-memory",
-  "version": "0.3.0",
+  "version": "0.9.0",
   "private": true,
   "type": "module",
-  "description": "Keeps a verbatim archive of the conversation in the workspace and points the model at it, instead of letting compaction throw the original wording away.",
-  "keywords": [
-    "dsh",
-    "dsh-plugin",
-    "memory",
-    "compaction",
-    "archive"
-  ],
-  "license": "MIT",
+  "description": "Keeps a verbatim archive of the conversation in the workspace and tells the model exactly which folder is its own.",
   "exports": {
     ".": "./index.js",
-    "./locale/*.json": "./locale/*.json"
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
   },
-  "files": [
-    "index.js",
-    "pack.mjs",
-    "cordis.patch.yml",
-    "locale/*.json",
-    "README.md"
-  ],
-  "engines": {
-    "dsh": "0.2.1-rc.2"
-  },
+  "files": ["index.js", "pack.mjs", "client.js", "cordis.patch.yml", "locale/*.json", "icon.svg"],
   "dsh": {
-    "bundle": {
-      "patch": "./cordis.patch.yml"
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "immediately": true
     }
   }
 }
