@@ -20,15 +20,18 @@
  * belongs to the folder, so moving or changing the workspace moves the archive
  * with it instead of leaving it behind.
  *
- * No language model is called and no prompt file is written. The model is told
- * where its archive is through a system-prompt section whose path is derived
- * from the live session on every step, which is the only way the answer stays
- * right when several sessions share one workspace.
+ * No language model is called and no prompt file is written.
  *
- * Pack modes, mutually exclusive:
+ * Packing and visibility are separate rhythms, and neither one raises a token
+ * cost of its own:
  *
- *   manual  pack when staging holds `windowRounds` exchanges
- *   sync    pack when DSH compacts, so the archive tracks what the model lost
+ *   packing      every `windowRounds` exchanges, whenever they arrive
+ *   visibility   only for the two steps after DSH compacts — that is the moment
+ *                the exchanges in a pack stop being in the conversation, and the
+ *                window exists so the model can write that pack a `_summary.md`
+ *
+ * The archive is invisible at every other time. Naming it while its exchanges are
+ * still in the window would only send the model to read what it already has.
  */
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
@@ -36,8 +39,11 @@ import { isAbsolute, join } from 'node:path'
 import { homedir } from 'node:os'
 
 import {
+  compactPacks,
+  compactionsDir,
   coverage,
   digestBodies,
+  listCompactions,
   listPacks,
   listStaged,
   packStaged,
@@ -58,13 +64,11 @@ export const name = 'memory-archive'
 export const inject = ['commands', 'systemPrompt']
 
 const DEFAULTS = {
-  /** 'manual' packs on a fixed number of exchanges; 'sync' follows DSH compaction. */
-  mode: 'manual',
-  /** Exchanges per pack in `manual` mode. */
+  /** Exchanges per pack. Packing always follows this count, never compaction. */
   windowRounds: 15,
   /** Where archives live, relative to the session's working directory. */
   rootDir: '.dsh-memory',
-  /** Warn the model once staging passes this many characters. */
+  /** Warn once staging passes this many characters. */
   warnAtChars: 200_000,
 }
 
@@ -326,7 +330,6 @@ function readSettings() {
     const raw = JSON.parse(readFileSync(SETTINGS_PATH, 'utf8'))
     if (raw === null || typeof raw !== 'object') return {}
     const out = {}
-    if (raw.mode === 'manual' || raw.mode === 'sync') out.mode = raw.mode
     if (Number.isFinite(raw.windowRounds) && raw.windowRounds > 0) {
       out.windowRounds = Math.round(raw.windowRounds)
     }
@@ -361,8 +364,16 @@ function currentOptions(base) {
 
 export function apply(ctx, config = {}) {
   const base = { ...DEFAULTS, ...config }
-  log('applying: mode=%s windowRounds=%d rootDir=%s', base.mode, base.windowRounds, base.rootDir)
+  log('applying: windowRounds=%d rootDir=%s', base.windowRounds, base.rootDir)
   log('settings file: %s', SETTINGS_PATH)
+  // One line that proves apply() ran at all, and whether the two services it
+  // needs are actually on this context. Without it a bundle that never activates
+  // looks exactly like a bundle that activated and did nothing.
+  log(
+    'services: systemPrompt=%s commands=%s',
+    typeof ctx.systemPrompt,
+    typeof ctx.commands,
+  )
 
   const warned = new Set()
 
@@ -395,13 +406,13 @@ export function apply(ctx, config = {}) {
       let packed = null
       const stagedCount = listStaged(stagingDir(root)).length
 
-      const shouldPack =
-        options.mode === 'manual'
-          ? stagedCount >= options.windowRounds
-          : reason === 'compaction' && stagedCount > 0
+      // Packing always follows the exchange count, whatever else is happening.
+      // A compaction no longer changes *when* a pack is made — it only decides
+      // when the archive becomes visible to the model (see `compactionNotice`).
+      const shouldPack = stagedCount >= options.windowRounds
 
       if (shouldPack) {
-        const take = options.mode === 'manual' ? options.windowRounds : stagedCount
+        const take = options.windowRounds
         const preview = previewDigest(stagingDir(root), take)
         const existing = listPacks(root).find((p) => p.digest === preview.digest)
 
@@ -430,6 +441,14 @@ export function apply(ctx, config = {}) {
           packed.maxSeq,
           packed.digest,
           staged.written,
+        )
+        // The turn after a pack is made is the one turn the model is asked for a
+        // summary: the pack is complete, its exchanges are still recent enough to
+        // be worth describing, and nothing else is owed.
+        oweNote(
+          String(session?.id ?? session?.header?.id ?? ''),
+          `刚刚打好了一个小包 ${JSON.stringify(join(root, 'packs', packed.packName))}（${packed.count} 轮对话）。` +
+            `请在那个文件夹里写一个 \`_summary.md\`，说明这一小包讲了什么。`,
         )
       } else if (packed !== null) {
         log(
@@ -484,6 +503,22 @@ export function apply(ctx, config = {}) {
       if (event?.type === 'compaction/summary') {
         log('compaction happened at seq %d', event.seq)
         archive(session, 'compaction')
+        // Compression moves every pack into this round's folder, and that move is
+        // what the model is then asked to describe.
+        try {
+          const root = archiveRoot(session)
+          const moved = compactPacks(root)
+          if (moved !== null) {
+            log('compaction folder %s: moved %d packs', moved.name, moved.moved)
+            oweNote(
+              String(session?.id ?? session?.header?.id ?? ''),
+              `刚发生过一次压缩，这次压缩的原文已经收进 ${JSON.stringify(join(moved.dir))}（${moved.moved} 个小包）。` +
+                `请在那个文件夹里写一个 \`_summary.md\`，说明这一次压缩覆盖了哪一段对话。`,
+            )
+          }
+        } catch (error) {
+          log('compaction move failed: %s', String(error?.message ?? error))
+        }
       }
     } catch (error) {
       log('event handler failed: %s', String(error?.stack ?? error))
@@ -502,7 +537,7 @@ export function apply(ctx, config = {}) {
           name: 'memory',
           description: '记忆归档：查看状态、调整打包节奏（改完下一次归档就生效）',
           input: {
-            hint: 'status | rounds <n> | mode <manual|sync> | warn <n> | reset',
+            hint: 'status | rounds <n> | warn <n> | reset',
           },
           handler: (invocation) => {
             // Logged because the command line and the panel reach this through
@@ -541,53 +576,115 @@ export function apply(ctx, config = {}) {
   // assembly taken *before* the pre-step waterfall, so a line registered into a
   // running Session is not in it yet. Appending it there is idempotent — the
   // loop's snapshot comparison keeps it to one occurrence per Session.
+  //
+  // These three lines are logged once at load, not per step: if the registration
+  // silently fails the model simply never learns where its archive is, which is
+  // indistinguishable from "it was told and ignored it". A single line at boot is
+  // the cheapest way to tell those two apart, so it stays.
   try {
     ctx.systemPrompt.context({
       name: 'memory-archive:home',
       order: 240,
       interpolate: false,
-      text: (context) => archiveLine(context.agent),
+      // The section must always resolve to a string. A section that answers
+      // `undefined` is a shape the assembly has never had to handle — the archive
+      // is invisible for most steps now — so it answers `''` instead, which is the
+      // one thing every caller can render.
+      text: (context) => {
+        try {
+          return takeNote(String(context.agent?.session?.id ?? context.agent?.session?.header?.id ?? '')) + archiveLine(context.agent)
+        } catch (error) {
+          log('prompt section failed (turn continues): %s', String(error?.message ?? error))
+          return ''
+        }
+      },
     })
+    log('systemPrompt.context registered (archive path follows the Session)')
   } catch (error) {
-    log('systemPrompt.context failed: %s', String(error?.message ?? error))
+    log('systemPrompt.context FAILED: %s', String(error?.message ?? error))
   }
 
-  ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
+  ctx.on('agent/pre-step', async ({ agent, step, signal }, next) => {
     const decision = await next()
     if (decision.kind === 'reject' || signal.aborted) return decision
-    const text = archiveLine(agent)
-    if (text === undefined) return decision
-    const rendered = decision.messages.map(renderedContext).filter((value) => value !== undefined)
-    if (rendered.includes(text)) return decision
-    return { ...decision, messages: [...decision.messages, ownMessage(text)] }
+    // Everything below is additive courtesy, never a precondition: a throw here
+    // fails the whole turn, and a turn must not fail because a memory hint could
+    // not be built.
+    try {
+      const text = archiveLine(agent)
+      if (text === undefined) return decision
+      if (!Array.isArray(decision.messages)) return decision
+      const rendered = decision.messages.map(renderedContext).filter((value) => value !== undefined)
+      if (rendered.includes(text)) return decision
+      return { ...decision, messages: [...decision.messages, ownMessage(text)] }
+    } catch (error) {
+      log('pre-step hint failed (turn continues): %s', String(error?.message ?? error))
+      return decision
+    }
   })
+  log('agent/pre-step hook registered (covers a Session whose assembly predates this)')
 }
 
 /**
- * The one line naming this Session's archive directory, or `undefined` when the
- * Session has no usable working directory.
+ * The one line the model reads every turn, plus the two one-turn requests.
  *
- * Points at `packs/` only. `staging/` holds the exchanges that are still in the
- * model's own context, so naming it would send the model to read what it already
- * has; `packs/` is the part that has left the window.
+ * Always: where the compressed archive is, so the model knows a searchable copy
+ * of older exchanges exists and can go look when it needs one.
  *
- * Created here rather than lazily on first write, so the directory the model is
- * told about exists before the model goes looking for it.
+ * Only on the turn it is owed: a request to describe the pack just made, or the
+ * compression just performed. Those are owed exactly once — repeating them would
+ * be asking the model to rewrite a summary it has already written.
  */
 function archiveLine(agent) {
   const session = agent?.session
   const cwd = session?.header?.cwd
-  if (cwd === undefined || !isAbsolute(cwd)) return undefined
+  if (cwd === undefined || !isAbsolute(cwd)) return ''
+
   try {
-    const packs = join(archiveRoot(session), 'packs')
-    mkdirSync(packs, { recursive: true })
-    return (
-      `更早的对话归档在：${JSON.stringify(packs)}（一轮问答一个 .md，按包分文件夹）。` +
-      `如果那里是空的，说明还没有打包的历史。`
-    )
+    const root = archiveRoot(session)
+    const compressed = compactionsDir(root)
+    mkdirSync(compressed, { recursive: true })
+
+    const lines = [
+      `更早的对话在压缩归档里：${JSON.stringify(compressed)}（每次压缩一个文件夹，里面是当时的原文，按包号排序）。` +
+        `需要时可以去那里翻原文；如果它是空的，说明还没有被压缩过的历史。`,
+    ]
+
+    const pending = pendingNotes.get(String(session?.id ?? session?.header?.id ?? ''))
+    if (pending !== undefined) lines.push(pending)
+    return lines.join('\n')
   } catch {
-    return undefined
+    return ''
   }
+}
+
+/**
+ * One-shot requests owed to the model, keyed by Session id.
+ *
+ * A request lives here for one assembly and is then dropped: the next assembly
+ * no longer carries it. Keeping it would have the model rewrite the same summary
+ * on every turn from then on.
+ */
+const pendingNotes = new Map()
+
+/** Queue a request that the next assembly will carry, then forget. */
+function oweNote(sessionId, text) {
+  if (sessionId === '') return
+  pendingNotes.set(sessionId, text)
+  log('owing one note to %s', sessionId)
+}
+
+/**
+ * Take the request owed to this Session, if any, and forget it.
+ *
+ * Reading and dropping in one call is what makes it one-shot: the assembly that
+ * reads it is the only one that will.
+ */
+function takeNote(sessionId) {
+  const held = pendingNotes.get(sessionId)
+  if (held === undefined) return ''
+  pendingNotes.delete(sessionId)
+  return held
 }
 
 /** A runtime-context message carrying exactly that line. */
@@ -638,7 +735,6 @@ function handleMemoryCommand(base, raw) {
     const options = currentOptions(base)
     return ok(
       [
-        `模式：${options.mode}`,
         `每包轮数：${options.windowRounds}`,
         `预警字数：${options.warnAtChars}`,
         `归档目录：${options.rootDir}`,
@@ -646,23 +742,15 @@ function handleMemoryCommand(base, raw) {
     )
   }
 
-  if (sub === 'rounds' || sub === 'mode' || sub === 'warn') {
+  if (sub === 'rounds' || sub === 'warn') {
     const value = parts[1]
     if (value === undefined) return fail(`用法：/memory ${sub} <值>`)
 
-    let parsed
-    if (sub === 'mode') {
-      if (value !== 'manual' && value !== 'sync') {
-        return fail(`模式只能是 manual 或 sync，收到：${value}`)
-      }
-      parsed = value
-    } else {
-      const n = Number(value)
-      if (!Number.isFinite(n) || n <= 0) return fail(`需要一个正数，收到：${value}`)
-      parsed = Math.round(n)
-    }
+    const n = Number(value)
+    if (!Number.isFinite(n) || n <= 0) return fail(`需要一个正数，收到：${value}`)
+    const parsed = Math.round(n)
 
-    const key = sub === 'rounds' ? 'windowRounds' : sub === 'mode' ? 'mode' : 'warnAtChars'
+    const key = sub === 'rounds' ? 'windowRounds' : 'warnAtChars'
 
     try {
       writeSettings({ [key]: parsed })
@@ -684,6 +772,6 @@ function handleMemoryCommand(base, raw) {
     return ok('已恢复默认配置。下一次归档就生效。')
   }
 
-  return fail('用法：/memory status | rounds <n> | mode <manual|sync> | warn <n> | reset')
+  return fail('用法：/memory status | rounds <n> | warn <n> | reset')
 }
 

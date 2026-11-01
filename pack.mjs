@@ -390,6 +390,98 @@ export function stagingChars(dir) {
   return total
 }
 
+/** Where compression moves the packs to. */
+export function compactionsDir(root) {
+  return join(root, 'compactions')
+}
+
+/** Every compaction folder, oldest first, by the number in its name. */
+export function listCompactions(root) {
+  const dir = compactionsDir(root)
+  let names
+  try {
+    names = readdirSync(dir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && /^compaction-\d+$/.test(entry.name))
+      .map((entry) => entry.name)
+  } catch {
+    return []
+  }
+  return names
+    .sort((a, b) => Number(a.slice(11)) - Number(b.slice(11)))
+    .map((name) => ({ name, dir: join(dir, name) }))
+}
+
+/** The number the next compaction folder should carry. */
+function nextCompactionName(root) {
+  const existing = listCompactions(root)
+  let highest = 0
+  for (const entry of existing) {
+    const n = Number(entry.name.slice(11))
+    if (Number.isFinite(n)) highest = Math.max(highest, n)
+  }
+  return `compaction-${String(highest + 1).padStart(3, '0')}`
+}
+
+/**
+ * Move every pack into a new compaction folder, emptying `packs/`.
+ *
+ * A move, not a copy: after this returns the packs exist in exactly one place.
+ * The packs keep their names, so the order inside a compaction folder is the
+ * order they were packed in — read by the number in the name, never by mtime,
+ * because a move rewrites mtime and would erase exactly the ordering that
+ * matters here.
+ *
+ * @returns {{ name: string, dir: string, moved: number } | null} null when there
+ *          was nothing to move.
+ */
+export function compactPacks(root) {
+  const packs = listPacks(root)
+  if (packs.length === 0) return null
+
+  const base = compactionsDir(root)
+  mkdirSync(base, { recursive: true })
+  const name = nextCompactionName(root)
+  const dir = join(base, name)
+  mkdirSync(dir, { recursive: true })
+
+  let moved = 0
+  for (const pack of packs) {
+    const target = join(dir, pack.name)
+    try {
+      renameSync(pack.dir, target)
+      moved += 1
+    } catch {
+      // A directory on another volume cannot be renamed across; fall back to a
+      // recursive move so the pack still leaves `packs/` exactly once.
+      try {
+        renameWithinVolume(pack.dir, target)
+        moved += 1
+      } catch {
+        /* leave it for the next compaction rather than lose it */
+      }
+    }
+  }
+
+  return { name, dir, moved }
+}
+
+/**
+ * Copy a directory tree and then remove the source.
+ *
+ * Used only when a direct rename cannot span the two locations. The source is
+ * removed after the copy so the move stays a move.
+ */
+function renameWithinVolume(from, to) {
+  mkdirSync(to, { recursive: true })
+  for (const entry of readdirSync(from, { withFileTypes: true })) {
+    const source = join(from, entry.name)
+    const target = join(to, entry.name)
+    if (entry.isDirectory()) renameWithinVolume(source, target)
+    else renameSync(source, target)
+  }
+  rmSync(from, { recursive: true, force: true })
+}
+
 /** How many staged exchanges have no captured answer. */
 export function stagedUnanswered(dir) {
   let count = 0

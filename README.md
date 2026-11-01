@@ -10,26 +10,40 @@ markdown the model can read with ordinary file tools.
 
 ## What it does
 
-1. **Copy.** After each completed exchange, the question and the answer are
-   written to `staging/`, one file per exchange.
-2. **Pack.** Once staging holds enough exchanges they move into `packs/pack-NNN/`,
-   one file per exchange, and `_note.md` records what that pack holds. The staged
-   copies are deleted, so the archive never holds the same exchange twice.
-3. **Point.** On every step the model receives one runtime-context line naming
-   *its own* `packs/` folder. `staging/` is deliberately not named: it holds the
-   exchanges still in the model's context, so pointing at it would send the model
-   to read what it already has.
+Three folders, each moving into the next:
 
-The model reads a pack only when it decides to. Nothing is injected into the
+1. **Copy (A → staging).** After each completed exchange, the question and the
+   answer are written to `staging/`, one file per exchange.
+2. **Pack (A → B).** Once staging holds `windowRounds` exchanges they move into
+   `packs/pack-NNN/`, renumbered `01.md`, `02.md`, … so the order is the order
+   they were written, and `_note.md` records what the pack holds. The staged
+   copies are deleted. On the turn after a pack is made, the model is asked once
+   to write that pack's `_summary.md`.
+3. **Compress (B → C).** When DSH compacts, every pack is moved into
+   `compactions/compaction-NNN/` — one folder per compaction, numbered, so packs
+   stay in conversation order. `packs/` is emptied. The model is asked once to
+   write that compaction's `_summary.md`.
+
+The model is told, on every step, that `compactions/` holds the compressed
+original text and can be searched when it needs an older exchange. That is the
+only permanent line. `staging/` and `packs/pack-NNN/` are deliberately never
+named: their contents are still in the model's own context, so pointing at them
+would send it to read what it already has.
+
+The model reads the archive only when it decides to. Nothing is injected into the
 conversation.
 
 ## What it writes
 
 ```
 <workspace>/.dsh-memory/<session>/
-  staging/NNNN.md                exchanges copied, not yet packed
-  packs/pack-NNN/NN.md           one exchange per file (01.md, 02.md, …)
-  packs/pack-NNN/_note.md        what the pack holds, and a content digest
+  staging/NNNN.md                     exchanges copied, not yet packed
+  packs/pack-NNN/NN.md                one exchange per file (01.md, 02.md, …)
+  packs/pack-NNN/_note.md             what the pack holds, and a content digest
+  packs/pack-NNN/_summary.md          written by the model, when asked
+  compactions/compaction-NNN/         one folder per DSH compaction
+    pack-NNN/                         the packs that compaction covered
+    _summary.md                       written by the model, when asked
 ```
 
 The `<session>` level exists because question seqs restart at zero in every
@@ -48,7 +62,6 @@ next exchange — no restart.
 
 ```json
 {
-  "mode": "manual",
   "windowRounds": 15,
   "warnAtChars": 200000
 }
@@ -56,8 +69,7 @@ next exchange — no restart.
 
 | Key | Meaning |
 |---|---|
-| `mode` | `manual` packs every `windowRounds` exchanges; `sync` packs when DSH compacts |
-| `windowRounds` | exchanges per pack in `manual` mode |
+| `windowRounds` | exchanges per pack |
 | `warnAtChars` | warn once staging passes this many characters |
 | `rootDir` | where the archive lives, relative to the session's working directory |
 
@@ -73,7 +85,6 @@ writing.
 ```
 /memory status
 /memory rounds 20
-/memory mode sync
 /memory warn 300000
 /memory reset
 ```
@@ -112,6 +123,19 @@ the past made while the answer is still being produced.
 workspace is the user's business, and treating it as an attack would mean carrying
 error handling for a case the user brought on themselves. The digest in each note
 is enough for anyone who wants to check.
+
+## What has been verified
+
+`staging/` and `packs/` were exercised on a real DSH session: exchanges appear as
+`staging/NNNN.md`, a pack appears as `packs/pack-001/` with its `_note.md`, and the
+staging copies are deleted. The plugin loads without error and registers
+`systemPrompt.context`, `agent/pre-step` and `/memory`.
+
+**The `compactions/` step has not been exercised.** Reaching it needs DSH to
+actually compact, which needs a conversation long enough to cross the compaction
+threshold — and that could not be produced in the test environment. The code is
+written and reviewed, but its behaviour has not been observed. If the move fails,
+nothing is lost: the packs stay in `packs/` and are moved on the next compaction.
 
 ## Requirements
 

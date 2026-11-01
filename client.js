@@ -18,11 +18,6 @@ window.__ModuleLoader__.load({
       trigger: '记忆归档',
       title: '记忆归档设置',
       hint: '调整打包节奏。改动写入配置，重启 DSH 后生效。',
-      mode: '打包模式',
-      modeManual: '按轮数',
-      modeSync: '跟随 DSH 压缩',
-      modeManualNote: '每攒够设定轮数打成一个包。包更细，索引更密。',
-      modeSyncNote: 'DSH 压缩发生时，把这次移出视野的对话打成包。',
       rounds: '每包轮数',
       roundsUnit: '轮',
       warn: '预警字数',
@@ -142,11 +137,10 @@ window.__ModuleLoader__.load({
        * representation instead of two that can disagree.
        */
       function parseStatus(text) {
-        const out = { mode: null, rounds: null, warn: null }
+        const out = { rounds: null, warn: null }
         for (const raw of String(text).split('\n')) {
-          const m = /^(模式|每包轮数|预警字数)：(.+)$/.exec(raw.trim())
+          const m = /^(每包轮数|预警字数)：(.+)$/.exec(raw.trim())
           if (m === null) continue
-          if (m[1] === '模式') out.mode = m[2].trim()
           if (m[1] === '每包轮数') {
             const n = Number(m[2].trim())
             if (Number.isFinite(n)) out.rounds = n
@@ -167,9 +161,8 @@ window.__ModuleLoader__.load({
         // reports after the form was last saved or loaded, so the sliders show
         // what is really in the patch file rather than the numbers this panel
         // happened to have touched.
-        const [last, setLast] = React.useState({ mode: 'manual', rounds: 15, warn: 200000 })
-        const [mode, setMode] = React.useState('manual')
-        const [rounds, setRounds] = React.useState(15)
+        const [last, setLast] = React.useState({ rounds: 15, warn: 200000 })
+          const [rounds, setRounds] = React.useState(15)
         const [warn, setWarn] = React.useState(200000)
         const [tutorial, setTutorial] = React.useState(false)
         const [busy, setBusy] = React.useState(false)
@@ -183,12 +176,12 @@ window.__ModuleLoader__.load({
 
         const adopt = (parsed) => {
           const next = {
-            mode: parsed.mode ?? last.mode,
+    
             rounds: parsed.rounds ?? last.rounds,
             warn: parsed.warn ?? last.warn,
           }
           setLast(next)
-          setMode(next.mode)
+  
           setRounds(next.rounds)
           setWarn(next.warn)
         }
@@ -261,36 +254,6 @@ window.__ModuleLoader__.load({
                 h('button', { type: 'button', className: 'dm-x', onClick: () => setOpen(false) }, '×'),
               ),
               h('p', { className: 'dm-note' }, T.hint),
-
-              card('mode', T.mode, [
-                h(
-                  'div',
-                  { className: 'dm-choices', key: 'c' },
-                  h(
-                    'button',
-                    {
-                      key: 'm',
-                      type: 'button',
-                      className: 'dm-choice',
-                      'data-on': mode === 'manual',
-                      onClick: () => setMode('manual'),
-                    },
-                    T.modeManual,
-                  ),
-                  h(
-                    'button',
-                    {
-                      key: 's',
-                      type: 'button',
-                      className: 'dm-choice',
-                      'data-on': mode === 'sync',
-                      onClick: () => setMode('sync'),
-                    },
-                    T.modeSync,
-                  ),
-                ),
-                h('p', { className: 'dm-note', key: 'n' }, mode === 'manual' ? T.modeManualNote : T.modeSyncNote),
-              ]),
 
               card('rounds', T.rounds, [
                 h(
@@ -385,7 +348,7 @@ window.__ModuleLoader__.load({
                     'data-kind': 'primary',
                     disabled: busy,
                     onClick: () =>
-                      void send([`mode ${mode}`, `rounds ${rounds}`, `warn ${warn}`]),
+                      void send([`rounds ${rounds}`, `warn ${warn}`]),
                   },
                   busy ? T.saving : '保存',
                 ),

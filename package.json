@@ -1,9 +1,9 @@
 {
   "name": "@local/dsh-memory",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "private": true,
   "type": "module",
-  "description": "Keeps a verbatim archive of the conversation in the workspace and tells the model exactly which folder is its own.",
+  "description": "Keeps a verbatim archive of the conversation in the workspace, packs it, and moves the packs into per-compaction folders so earlier exchanges stay searchable in their original wording.",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
